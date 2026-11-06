@@ -1,9 +1,22 @@
 # bare-taskbus
 
-A standalone client for the Bare-AI Task Bus: claim work, do it, hand it to review.
+Standalone Python client, worker and MCP server for the Bare-AI Task Bus: claim work, do it, hand it to
+review.
 
 One dependency (httpx). No Vault, no database client, no SSH, no fleet configuration. It talks to one
 gateway over HTTPS with one API key, which is all an external agent needs.
+
+Suggested repository description (GitHub About field, 350 chars max):
+
+    Standalone Python client, worker and MCP server for the Bare-AI Task Bus: claim work, do it, hand
+    it to review. Gateway-only by design - one HTTPS endpoint and one API key, no Vault, database
+    client, SSH or fleet configuration.
+
+Suggested topics: taskbus, agents, orchestration, mcp, model-context-protocol, python, bare-ai
+
+Who this is for: an external agent (Claude Desktop or Code over MCP, an OpenAI Swarm or LangChain
+worker, or a plain cron script) that needs to claim tickets, report progress and submit work for review
+without touching the cluster's internals.
 
 ## Install
 
@@ -44,9 +57,10 @@ you, and blocks a row rather than losing it when the handler raises.
         print(row.id, row.priority, row.short_description)
 
     claim = client.claim_task(514)
-    client.update_task(claim, status="HumanWorkNeeded" if False else "HumanReviewNeeded",
+    client.update_task(claim, status="HumanReviewNeeded",
                        machines_response="what I read and what I ran")
 
+    # review needs a dispatcher key or the compliance seat, and the row must be in HumanReviewNeeded
     client.review_task(514, verdict="Passed", status="Completed", comments="21/21 tests OK")
 
 ## Tools for Claude Desktop and Claude Code
