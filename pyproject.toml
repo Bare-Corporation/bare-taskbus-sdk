@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bare-taskbus"
+version = "0.1.0"
+description = "Standalone client, worker and MCP server for the Bare-AI Task Bus"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Bare-Corporation" }]
+keywords = ["taskbus", "agents", "orchestration", "mcp", "bare-ai"]
+dependencies = ["httpx>=0.24"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.0"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+bare-taskbus-worker = "bare_taskbus.worker:main"
+bare-taskbus-mcp = "bare_taskbus.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bare_taskbus"]
