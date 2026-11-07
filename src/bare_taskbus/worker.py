@@ -17,11 +17,31 @@ The loop order matters and each step exists because its absence caused a real fa
   4. dispatch to the handler, then write the result back with the claim nonce.
   5. any handler exception becomes status=Blocked with a short trace tail. Never leave a claimed row
      to rot until its lease lapses: the lease is a backstop, not a workflow.
+
+Lease semantics, measured on the gateway and not negotiable from this side:
+
+  * LEASE_SECONDS = 900. A claim holds the row for 15 minutes. The value is a module
+    constant on the server: it is not configurable per claim, per key or per tenant.
+  * There is no renewal and no heartbeat. No renew route exists and a PATCH does not
+    extend lease_expires_at. More time means re-claiming after expiry, which mints a
+    NEW nonce (invalidating the old one) and increments attempts_taken.
+  * With max_attempts defaulting to 3, the commonly quoted 45 minutes is the maximum
+    CUMULATIVE LEASED EXECUTION TIME across three attempts. It is NOT a wall-clock
+    ceiling. Reclamation is lazy - no sweeper walks the table - so a row becomes
+    claimable at lease_expires_at but is only reclaimed when some caller next claims.
+    Wall-clock time from first claim to a terminal write can therefore exceed 45
+    minutes by an arbitrary margin.
+  * Because the lease cannot be extended, this worker runs the handler under a
+    watchdog (default 840 s = 14 min) and gives up BEFORE the lease lapses, returning
+    the row as Blocked with a reason. Yielding early is the only honest option: a
+    handler that outlives its lease may write back with a nonce that no longer proves
+    anything.
 """
 import logging
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -32,6 +52,10 @@ log = logging.getLogger("bare_taskbus.worker")
 
 REFRESH_RATIO = 0.8
 MIN_REFRESH_SECONDS = 60
+# Server-side lease, mirrored here so the worker can yield before it lapses.
+LEASE_SECONDS = 900
+# Default handler watchdog: 14 minutes, one minute short of the 15-minute lease.
+JOB_WATCHDOG_SECONDS = 840
 
 
 @dataclass
@@ -50,13 +74,17 @@ def _env_flag(name, default=False):
 
 class TaskbusWorker:
     def __init__(self, client: TaskbusClient, handler: Callable[[Row, TaskbusClient], HandlerResult],
-                 interval=None, max_concurrent=1, refresh=None, identity=None):
+                 interval=None, max_concurrent=1, refresh=None, identity=None,
+                 watchdog=None):
         self.client = client
         self.handler = handler
         self.interval = int(interval or os.environ.get("TASKBUS_POLL_INTERVAL") or 60)
         self.max_concurrent = max(1, int(max_concurrent))
         self.refresh_enabled = _env_flag("TASKBUS_REFRESH", True) if refresh is None else bool(refresh)
         self.identity = identity or os.environ.get("TASKBUS_IDENTITY") or ""
+        # Run the handler under a watchdog that expires before the server lease does.
+        self.watchdog = int(watchdog or os.environ.get("TASKBUS_JOB_WATCHDOG")
+                            or JOB_WATCHDOG_SECONDS)
         self._child = None
         self._child_expires_at = 0.0
         self._stopped = False
@@ -108,7 +136,7 @@ class TaskbusWorker:
                 log.warning("could not claim row %s: %s", row.id, exc)
                 continue
             try:
-                result = self.handler(row, client) or HandlerResult()
+                result = self._run_handler(row, client)
             except Exception:
                 tail = traceback.format_exc().strip().splitlines()[-4:]
                 result = HandlerResult(status="Blocked", summary="handler raised",
@@ -124,6 +152,29 @@ class TaskbusWorker:
                 summary["error"] = "write-back: %s" % exc
                 log.warning("write-back failed for row %s: %s", row.id, exc)
         return summary
+
+    def _run_handler(self, row, client):
+        """Run the handler under a watchdog that expires before the lease does.
+
+        The lease cannot be extended, so a handler that outranks it would write back
+        with a nonce that no longer proves anything. A thread cannot be killed in
+        Python, so an overrunning handler is abandoned - the row is released as
+        Blocked and the process exits once that thread finishes.
+        """
+        pool = ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(self.handler, row, client)
+        try:
+            return future.result(timeout=self.watchdog) or HandlerResult()
+        except FuturesTimeout:
+            log.warning("handler for row %s exceeded watchdog of %ss", row.id, self.watchdog)
+            return HandlerResult(
+                status="Blocked",
+                summary="handler exceeded the %ss watchdog" % self.watchdog,
+                reason=("no result within %ss; released before the %ss lease could lapse"
+                        % (self.watchdog, LEASE_SECONDS)))
+        finally:
+            pool.shutdown(wait=False)
+
 
     def _mine(self, row: Row) -> bool:
         """Open mode claims anything unowned; a set identity claims only its own rows."""

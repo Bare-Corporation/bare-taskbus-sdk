@@ -102,6 +102,37 @@ These are not style choices. Each one is a failure that costs real attempts to d
    must fail closed: release held rows and stop claiming rather than run on a credential you cannot
    prove is valid.
 
+## Lease window and tenant isolation
+
+Two server contracts that shape how a worker should behave, both verified against the live
+gateway.
+
+**The lease is 900 seconds and cannot be renewed.** `LEASE_SECONDS = 900` is a module constant on
+the server - not something a client can ask to change. There is no renew route, and a PATCH does
+not extend `lease_expires_at`. The only way to get more time is to re-claim after expiry, which
+mints a new nonce (invalidating the old one) and increments `attempts_taken`.
+
+**45 minutes is cumulative leased time, not a wall-clock ceiling.** With `max_attempts` defaulting
+to 3, a task can be leased for at most 3 x 15 minutes of execution. Reclamation is lazy: no
+sweeper walks the table. A row becomes claimable the instant `lease_expires_at` passes, but it is
+only actually reclaimed when some caller next posts a claim. So the wall-clock interval from first
+claim to a terminal write can exceed 45 minutes by an arbitrary margin - an operator watching for a
+45-minute deadline will not see a state change at that mark.
+
+Because the lease cannot be extended, `TaskbusWorker` runs your handler under a watchdog
+(`JOB_WATCHDOG_SECONDS = 840`, i.e. 14 minutes) and releases the row as Blocked before the lease
+lapses. Override with `watchdog=` or `TASKBUS_JOB_WATCHDOG`.
+
+**Review is tenant-gated, and a foreign row answers 404.** `POST /v1/taskbus/rows/{id}/review`
+first applies Gate 1, tenant isolation: the caller stakeholder must appear on the row
+`stakeholder_account_master`. A caller from another tenant is refused **404 `row_not_found`**,
+deliberately not 403, because a 403 would confirm that the row exists and belongs to somebody
+else. The gate runs before the idempotent branch, so a foreign row recorded verdict is never
+echoed back. Only then does Gate 2 apply - reviewer authority, `403 forbidden_not_reviewer` for a
+key that is neither a dispatcher holding `taskbus:write` nor the compliance reviewer seat. Two
+gates, two codes, not interchangeable.
+
+
 ## Criterion grammar
 
 A ticket's success_criterion is a semicolon-separated list, and all checks must pass:

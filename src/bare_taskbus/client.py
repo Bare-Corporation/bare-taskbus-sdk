@@ -7,6 +7,15 @@ Deliberate design notes, each of which cost a real attempt to learn on the fleet
     and silently ignored by others, so this client only ever sends page_size.
   * an executor may move a row to InProgress, HumanReviewNeeded or Blocked. Completed is refused to
     an executor, so the client blocks it locally instead of spending a call on a 403.
+  * the lease is 900 seconds and cannot be renewed. There is no renew route and a PATCH does not
+    extend lease_expires_at: re-claiming after expiry is the only way to get more time, and it
+    mints a new nonce. Reclamation is LAZY (no sweeper), so a row becomes claimable at expiry but
+    is only reclaimed when somebody next claims it. 45 minutes is the cumulative leased execution
+    time across the default 3 attempts, not a wall-clock ceiling.
+  * POST /rows/{id}/review is tenant-gated. If the caller stakeholder is not on the row
+    stakeholder_account_master, the route answers 404 row_not_found - deliberately a 404 and not
+    a 403, because a 403 would confirm the row exists in another tenant. That gate runs BEFORE the
+    idempotent branch, so a foreign row recorded verdict is never echoed back.
 """
 import json
 import os
