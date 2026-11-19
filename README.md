@@ -99,21 +99,34 @@ These are not style choices. Each one is a failure that costs real attempts to d
 Two server contracts that shape how a worker should behave, both verified against the live
 gateway.
 
-**The lease is 900 seconds and cannot be renewed.** `LEASE_SECONDS = 900` is a module constant on
-the server - not something a client can ask to change. There is no renew route, and a PATCH does
-not extend `lease_expires_at`. The only way to get more time is to re-claim after expiry, which
-mints a new nonce (invalidating the old one) and increments `attempts_taken`.
+**The lease is 900 seconds and a heartbeat EXTENDS it.** `LEASE_SECONDS = 900` is a module
+constant on the server - not something a client can ask to change. `POST
+/v1/taskbus/rows/{row_id}/heartbeat` with the claim nonce pushes `lease_expires_at` forward, so a
+long task no longer has to fit inside one 900-second window. The client exposes it as
+`TaskbusClient.heartbeat(claim)`; `TaskbusWorker` calls it for you while your handler runs, every
+`TASKBUS_HEARTBEAT_INTERVAL` seconds (default `LEASE_SECONDS / 3` = 300).
 
-**45 minutes is cumulative leased time, not a wall-clock ceiling.** With `max_attempts` defaulting
-to 3, a task can be leased for at most 3 x 15 minutes of execution. Reclamation is lazy: no
-sweeper walks the table. A row becomes claimable the instant `lease_expires_at` passes, but it is
-only actually reclaimed when some caller next posts a claim. So the wall-clock interval from first
-claim to a terminal write can exceed 45 minutes by an arbitrary margin - an operator watching for a
-45-minute deadline will not see a state change at that mark.
+**Renewal is bounded: `HEARTBEAT_HORIZON_SECONDS = 7200`.** Heartbeats extend a claim only up to two
+hours counted from the claim itself. Past that horizon the claim lapses and the row must be
+re-claimed, which mints a new nonce (invalidating the old one) and increments `attempts_taken`. The
+bound is a published constant because the route does not report a per-tenant horizon.
 
-Because the lease cannot be extended, `TaskbusWorker` runs your handler under a watchdog
-(`JOB_WATCHDOG_SECONDS = 840`, i.e. 14 minutes) and releases the row as Blocked before the lease
-lapses. Override with `watchdog=` or `TASKBUS_JOB_WATCHDOG`.
+**A 409 from the heartbeat does NOT revive the claim.** It means the claim is no longer live - the
+row left InProgress, or the lease already lapsed and the nonce is stale - and every later write with
+that nonce is refused too. `TaskbusWorker` stops heartbeating, discards the handler result and does
+NOT write back, because a write would only earn a second 409 and a misleading log line. Never treat
+409 as a retryable blip: recovery means re-claiming.
+
+**Reclamation is still lazy, and 45 minutes is still cumulative leased time.** No sweeper walks the
+table: a row becomes claimable the instant `lease_expires_at` passes, but is only reclaimed when
+some caller next posts a claim. With `max_attempts` defaulting to 3 and no heartbeats, that is 3 x
+15 minutes of execution - not a wall-clock deadline an operator can watch for.
+
+**The watchdog follows the horizon, not the lease.** With heartbeats on (the default), the
+`TaskbusWorker` watchdog defaults to `HEARTBEAT_HORIZON_SECONDS - HEARTBEAT_MARGIN_SECONDS` so a run
+still stops before renewal runs out. Set `TASKBUS_HEARTBEAT=0` and it returns to
+`JOB_WATCHDOG_SECONDS = 840`, one minute short of the lease, which is the pre-0.1.2 behaviour.
+Either way, override with `watchdog=` or `TASKBUS_JOB_WATCHDOG`.
 
 **Review is tenant-gated, and a foreign row answers 404.** `POST /v1/taskbus/rows/{id}/review`
 first applies Gate 1, tenant isolation: the caller stakeholder must appear on the row
@@ -124,6 +137,38 @@ echoed back. Only then does Gate 2 apply - reviewer authority, `403 forbidden_no
 key that is neither a dispatcher holding `taskbus:write` nor the compliance reviewer seat. Two
 gates, two codes, not interchangeable.
 
+
+## Recursion is bounded by the row chain
+
+`parent_task` links make a task tree, and an agent that spawns work from work can walk it forever.
+Before dispatching, `TaskbusWorker` walks the chain with `TaskbusClient.spawn_depth(row_id)`; a row
+at or beyond `MAX_SPAWN_DEPTH` (3) runs no handler at all. It is claimed and immediately released as
+Blocked with the reason, so it leaves the queue instead of being picked up every cycle. That spends
+one attempt, for the same reason the fleet poller does: the gateway authorises a status write with
+the claim nonce, and an unclaimed row has none.
+
+The chain is the authority, not a counter, so a worker cannot launder its depth by omitting a field.
+The walk is cycle-safe and reports a malformed chain (a cycle, or a row with several parents) rather
+than guessing.
+
+## SUPERVISOR_RESULT
+
+A supervised runner finishes a task in passes and ends with an outcome rather than a status. It
+prints one line to stdout:
+
+```
+SUPERVISOR_RESULT {"outcome": "verified", "reason": "criteria met", "passes": 2,
+                   "state_path": "/tmp/s.md", "status_hint": "HumanReviewNeeded"}
+```
+
+`parse_supervisor_result(text)` finds the LAST such line in captured output (single-line JSON, one
+of many lines) and returns the envelope, or None - it never raises, because it runs on a failure
+path. `supervisor_close_body(parsed, log_excerpt=...)` maps the envelope onto a PATCH body and
+enforces two rules: the status is always `HumanReviewNeeded` or `Blocked`, never `Completed`, and a
+Blocked close always carries a non-empty `re_opened_or_retry_reason`.
+
+A handler can return one of these envelopes in `HandlerResult.summary`; the worker then closes with
+the envelope instead of the handler's own status hint.
 
 ## Criterion grammar
 

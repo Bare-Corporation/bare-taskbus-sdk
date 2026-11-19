@@ -22,40 +22,57 @@ Lease semantics, measured on the gateway and not negotiable from this side:
 
   * LEASE_SECONDS = 900. A claim holds the row for 15 minutes. The value is a module
     constant on the server: it is not configurable per claim, per key or per tenant.
-  * There is no renewal and no heartbeat. No renew route exists and a PATCH does not
-    extend lease_expires_at. More time means re-claiming after expiry, which mints a
-    NEW nonce (invalidating the old one) and increments attempts_taken.
-  * With max_attempts defaulting to 3, the commonly quoted 45 minutes is the maximum
-    CUMULATIVE LEASED EXECUTION TIME across three attempts. It is NOT a wall-clock
-    ceiling. Reclamation is lazy - no sweeper walks the table - so a row becomes
-    claimable at lease_expires_at but is only reclaimed when some caller next claims.
-    Wall-clock time from first claim to a terminal write can therefore exceed 45
-    minutes by an arbitrary margin.
-  * Because the lease cannot be extended, this worker runs the handler under a
-    watchdog (default 840 s = 14 min) and gives up BEFORE the lease lapses, returning
-    the row as Blocked with a reason. Yielding early is the only honest option: a
-    handler that outlives its lease may write back with a nonce that no longer proves
-    anything.
+  * The lease IS renewable, by heartbeat. While the handler runs this worker POSTs
+    /v1/taskbus/rows/{id}/heartbeat with the claim nonce every heartbeat_interval
+    seconds (default LEASE_SECONDS / 3 = 300), and the gateway pushes
+    lease_expires_at forward. A PATCH still does not extend the lease; only the
+    heartbeat route does.
+  * Renewal is BOUNDED. Heartbeats extend a claim only up to
+    HEARTBEAT_HORIZON_SECONDS (7200 s = 2 h) counted from the claim itself. Past that
+    horizon the claim lapses and the row must be re-claimed, which mints a NEW nonce
+    and spends another attempt. The route does not report a per-tenant horizon, so the
+    bound is a published constant.
+  * A 409 from the heartbeat does NOT revive the claim. It means the claim is no
+    longer live - the row left InProgress, or the lease already lapsed and the nonce
+    is stale - and every later write with that nonce will be refused too. This worker
+    stops heartbeating, abandons the handler result and does NOT write back: a write
+    would only earn a second 409 and a misleading log line.
+  * With heartbeats enabled the handler watchdog is no longer lease-bound. The
+    default becomes HEARTBEAT_HORIZON_SECONDS - HEARTBEAT_MARGIN_SECONDS, so a run
+    still stops before the renewal horizon; TASKBUS_JOB_WATCHDOG overrides it. With
+    heartbeats disabled (TASKBUS_HEARTBEAT=0) the watchdog is 840 s, one minute short
+    of the lease, which is the pre-0.1.2 behaviour.
+  * Recursion is bounded by the ROW CHAIN, not by a counter. Before dispatching, the
+    worker walks parent_task; a row at or beyond MAX_SPAWN_DEPTH (3) is claimed and
+    immediately released as Blocked, so it leaves the queue with a reason instead of
+    being picked up every cycle. That spends one attempt - the same trade the fleet
+    poller makes, for the same reason: the gateway authorises a status write with the
+    claim nonce, and an unclaimed row has none.
+  * A handler may return a SUPERVISOR_RESULT envelope in its summary. When it does,
+    the envelope decides the close, and never as Completed (see supervisor.py).
 """
 import logging
 import os
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
-from .client import TaskbusClient, Row
-from .errors import TaskbusError
+from .client import (HEARTBEAT_HORIZON_SECONDS, LEASE_SECONDS, MAX_SPAWN_DEPTH,
+                     TaskbusClient, Row)
+from .errors import TaskbusConflict, TaskbusError
+from .supervisor import parse_supervisor_result, supervisor_close_body
 
 log = logging.getLogger("bare_taskbus.worker")
 
 REFRESH_RATIO = 0.8
 MIN_REFRESH_SECONDS = 60
-# Server-side lease, mirrored here so the worker can yield before it lapses.
-LEASE_SECONDS = 900
-# Default handler watchdog: 14 minutes, one minute short of the 15-minute lease.
+# Watchdog used when heartbeats are DISABLED: 14 minutes, a minute short of the lease.
 JOB_WATCHDOG_SECONDS = 840
+# Stop a little before the renewal horizon so the closing write still lands inside it.
+HEARTBEAT_MARGIN_SECONDS = 300
 
 
 @dataclass
@@ -83,11 +100,18 @@ class TaskbusWorker:
         self.refresh_enabled = _env_flag("TASKBUS_REFRESH", True) if refresh is None else bool(refresh)
         self.identity = identity or os.environ.get("TASKBUS_IDENTITY") or ""
         # Run the handler under a watchdog that expires before the server lease does.
+        self.heartbeat_enabled = _env_flag("TASKBUS_HEARTBEAT", True)
+        # A third of the lease, so two beats can be missed before the claim is at risk.
+        self.heartbeat_interval = int(os.environ.get("TASKBUS_HEARTBEAT_INTERVAL")
+                                      or max(30, LEASE_SECONDS // 3))
+        default_watchdog = (max(60, HEARTBEAT_HORIZON_SECONDS - HEARTBEAT_MARGIN_SECONDS)
+                            if self.heartbeat_enabled else JOB_WATCHDOG_SECONDS)
         self.watchdog = int(watchdog or os.environ.get("TASKBUS_JOB_WATCHDOG")
-                            or JOB_WATCHDOG_SECONDS)
+                            or default_watchdog)
         self._child = None
         self._child_expires_at = 0.0
         self._stopped = False
+        self._claim_lost = False
 
     # ---- credential ------------------------------------------------------
     def ensure_credential(self):
@@ -112,7 +136,8 @@ class TaskbusWorker:
 
     # ---- one cycle -------------------------------------------------------
     def run_once(self) -> dict:
-        summary = {"claimed": 0, "completed": 0, "blocked": 0, "skipped": 0, "error": None}
+        summary = {"claimed": 0, "completed": 0, "blocked": 0, "skipped": 0,
+                   "lost": 0, "error": None}
         client = self._with_child()
         try:
             rows = client.list_tasks(status="new", page_size=100)
@@ -126,6 +151,12 @@ class TaskbusWorker:
         for row in claimable[: self.max_concurrent]:
             if self._stopped:
                 break
+            # Recursion guard BEFORE dispatch: a row at or beyond the depth limit
+            # never reaches the handler, not even once.
+            depth, depth_problem = client.spawn_depth(row.id)
+            if depth_problem:
+                log.warning("spawn depth NOT computed for row %s (%s)", row.id, depth_problem)
+            refuse_depth = depth >= MAX_SPAWN_DEPTH
             claim = None
             try:
                 claim = client.claim_task(row.id)
@@ -135,12 +166,48 @@ class TaskbusWorker:
                 summary["error"] = "claim: %s" % exc
                 log.warning("could not claim row %s: %s", row.id, exc)
                 continue
+            if refuse_depth:
+                reason = ("spawn depth %d has reached the limit of %d"
+                          % (depth, MAX_SPAWN_DEPTH))
+                log.error("row %s: REFUSED at claim time - %s (no handler will run)",
+                          row.id, reason)
+                try:
+                    client.release_task(claim, reason)
+                    summary["blocked"] += 1
+                except TaskbusError as exc:
+                    summary["error"] = "depth refusal write-back: %s" % exc
+                    log.warning("row %s: depth refusal could not be written: %s", row.id, exc)
+                continue
             try:
-                result = self._run_handler(row, client)
+                self._claim_lost = False
+                result = self._run_handler(row, client, claim)
             except Exception:
                 tail = traceback.format_exc().strip().splitlines()[-4:]
                 result = HandlerResult(status="Blocked", summary="handler raised",
                                        reason=" | ".join(tail)[:500])
+            if self._claim_lost:
+                # The heartbeat was refused with 409: the claim is gone and the
+                # nonce no longer authorises anything, so writing would only earn a
+                # second 409. Leave the row to the gateway's own reclamation.
+                log.warning("row %s: claim lost mid-handler; result discarded, not written",
+                            row.id)
+                summary["lost"] += 1
+                continue
+            body = supervisor_close_body(parse_supervisor_result(result.summary or ""),
+                                         log_excerpt=result.summary or "")
+            if body:
+                # A supervisor envelope outranks the handler's own status hint, and
+                # never says Completed.
+                try:
+                    client.update_task(claim, status=body["status"],
+                                       machines_response=body["machines_response"],
+                                       reason=body.get("re_opened_or_retry_reason"))
+                except TaskbusError as exc:
+                    summary["error"] = "write-back (supervisor): %s" % exc
+                    log.warning("supervisor write-back failed for row %s: %s", row.id, exc)
+                    continue
+                summary["blocked" if body["status"] == "Blocked" else "completed"] += 1
+                continue
             try:
                 client.update_task(claim, status=result.status,
                                    machines_response=result.summary, reason=result.reason)
@@ -153,14 +220,43 @@ class TaskbusWorker:
                 log.warning("write-back failed for row %s: %s", row.id, exc)
         return summary
 
-    def _run_handler(self, row, client):
-        """Run the handler under a watchdog that expires before the lease does.
+    def _heartbeat_loop(self, claim, stop_event):
+        """Renew the lease until the handler finishes or the claim is lost.
 
-        The lease cannot be extended, so a handler that outranks it would write back
-        with a nonce that no longer proves anything. A thread cannot be killed in
-        Python, so an overrunning handler is abandoned - the row is released as
-        Blocked and the process exits once that thread finishes.
+        A 409 is terminal: it means the row is no longer InProgress or the nonce is
+        stale, and the gateway will refuse the closing write with that nonce too. The
+        loop stops and raises the lost flag so the caller discards the result instead
+        of attempting a write that cannot land.
         """
+        while not stop_event.wait(self.heartbeat_interval):
+            try:
+                payload = self.client.heartbeat(claim)
+            except TaskbusConflict as exc:
+                log.warning("row %s: heartbeat refused (409) - claim is no longer live, "
+                            "not reviving it: %s", claim.row_id, exc)
+                self._claim_lost = True
+                return
+            except TaskbusError as exc:
+                # A transport blip is not a lost claim: keep trying until the lease
+                # horizon, so a single failed beat does not abandon the work.
+                log.warning("row %s: heartbeat failed (will retry): %s", claim.row_id, exc)
+                continue
+            log.debug("row %s: lease renewed %s", claim.row_id, payload.get("lease_expires_at"))
+
+    def _run_handler(self, row, client, claim=None):
+        """Run the handler under a watchdog, renewing the lease while it works.
+
+        Renewal is bounded by HEARTBEAT_HORIZON_SECONDS, so the watchdog defaults to
+        just inside that horizon rather than just inside one lease. A thread cannot be
+        killed in Python, so an overrunning handler is abandoned - the row is released
+        as Blocked and the process exits once that thread finishes.
+        """
+        stop_event = threading.Event()
+        beat = None
+        if claim is not None and self.heartbeat_enabled:
+            beat = threading.Thread(target=self._heartbeat_loop, args=(claim, stop_event),
+                                    name="taskbus-heartbeat", daemon=True)
+            beat.start()
         pool = ThreadPoolExecutor(max_workers=1)
         future = pool.submit(self.handler, row, client)
         try:
@@ -173,6 +269,9 @@ class TaskbusWorker:
                 reason=("no result within %ss; released before the %ss lease could lapse"
                         % (self.watchdog, LEASE_SECONDS)))
         finally:
+            stop_event.set()
+            if beat is not None:
+                beat.join(timeout=5)
             pool.shutdown(wait=False)
 
 

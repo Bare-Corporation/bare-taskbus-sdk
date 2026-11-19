@@ -7,11 +7,16 @@ Deliberate design notes, each of which cost a real attempt to learn on the fleet
     and silently ignored by others, so this client only ever sends page_size.
   * an executor may move a row to InProgress, HumanReviewNeeded or Blocked. Completed is refused to
     an executor, so the client blocks it locally instead of spending a call on a 403.
-  * the lease is 900 seconds and cannot be renewed. There is no renew route and a PATCH does not
-    extend lease_expires_at: re-claiming after expiry is the only way to get more time, and it
-    mints a new nonce. Reclamation is LAZY (no sweeper), so a row becomes claimable at expiry but
-    is only reclaimed when somebody next claims it. 45 minutes is the cumulative leased execution
-    time across the default 3 attempts, not a wall-clock ceiling.
+  * the lease is 900 seconds and a heartbeat EXTENDS it. POST /v1/taskbus/rows/{id}/heartbeat
+    with the claim nonce pushes lease_expires_at forward, so a long task no longer has to fit
+    inside one 900-second window. See heartbeat() and HEARTBEAT_HORIZON_SECONDS: renewal is
+    bounded, not infinite.
+  * a heartbeat that answers 409 does not revive anything. 409 means the claim is no longer live -
+    the row left InProgress, or the lease already lapsed and the nonce is stale - and the gateway
+    refuses every later write with that nonce too. The only recovery is to re-claim, which mints
+    a NEW nonce and spends another attempt. Never treat 409 as a retryable blip.
+  * a PATCH still does not extend the lease, and reclamation is LAZY (no sweeper): a row becomes
+    claimable at expiry but is only reclaimed when somebody next claims it.
   * POST /rows/{id}/review is tenant-gated. If the caller stakeholder is not on the row
     stakeholder_account_master, the route answers 404 row_not_found - deliberately a 404 and not
     a 403, because a 403 would confirm the row exists in another tenant. That gate runs BEFORE the
@@ -28,8 +33,18 @@ import httpx
 from .errors import TaskbusForbidden, TaskbusValidation, error_for
 
 DEFAULT_BASE_URL = "https://api.bare-ai.net"
-DEFAULT_UA = "bare-taskbus-sdk/0.1.0"
+DEFAULT_UA = "bare-taskbus-sdk/0.1.2"
 EXECUTOR_STATUSES = ("InProgress", "HumanReviewNeeded", "Blocked")
+# A claim holds the row for this long before it must be renewed or lapse.
+LEASE_SECONDS = 900
+# Renewal is bounded: heartbeats push lease_expires_at out, but only within this
+# horizon measured from the claim. Past it the claim lapses and the row must be
+# re-claimed (new nonce, another attempt spent).
+HEARTBEAT_HORIZON_SECONDS = 7200
+# A row whose parent_task chain is this deep is refused rather than executed:
+# recursion is bounded by the chain, not by a counter a worker could omit.
+MAX_SPAWN_DEPTH = 3
+PARENT_CHAIN_HARD_CAP = 32
 
 
 @dataclass
@@ -59,6 +74,22 @@ class Row:
     @property
     def assigned(self):
         return _val(self.raw.get("assigned_to_stakeholder_representative"))
+
+    @property
+    def parent_task(self):
+        """Ids of this row's parents. Accepts [1], [{"id": 1}] or 1."""
+        raw = self.raw.get("parent_task")
+        if raw is None:
+            return []
+        items = raw if isinstance(raw, list) else [raw]
+        out = []
+        for item in items:
+            value = item.get("id") if isinstance(item, dict) else item
+            try:
+                out.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def __repr__(self):
         return "Row(id=%r, status=%r, priority=%r)" % (self.id, self.status, self.priority)
@@ -186,6 +217,55 @@ class TaskbusClient:
         if verifier_rep_uuid:
             body["verifier_rep_uuid"] = verifier_rep_uuid
         return self._request("POST", "/v1/taskbus/rows/%d/review" % int(row_id), body)
+
+    # ---- lease -----------------------------------------------------------
+    def heartbeat(self, claim: Claim) -> Dict[str, Any]:
+        """Extend a claim's lease. Returns the gateway payload.
+
+        The nonce travels in X-Claim-Nonce, exactly like every other write. A 409
+        means the claim is no longer live and is NOT revived by retrying: it raises
+        TaskbusConflict, which the caller must treat as "stop working on this row".
+        """
+        if not claim or not claim.nonce:
+            raise TaskbusValidation("heartbeat needs a claim with a nonce")
+        return self._request("POST", "/v1/taskbus/rows/%d/heartbeat" % int(claim.row_id),
+                             {}, nonce=claim.nonce)
+
+    # ---- recursion -------------------------------------------------------
+    def spawn_depth(self, row_id):
+        """(depth, problem) for a row, walking parent_task upward.
+
+        The chain is the authority, not a counter a caller could omit. The walk is
+        cycle-safe and capped independently of MAX_SPAWN_DEPTH, and a malformed
+        chain reports a problem instead of looping.
+        """
+        depth = 0
+        seen = set()
+        try:
+            current = int(row_id)
+        except (TypeError, ValueError):
+            return 0, "row id %r is not an integer" % (row_id,)
+        while True:
+            if current in seen:
+                return depth, "parent chain cycles at row %s" % current
+            seen.add(current)
+            if len(seen) > PARENT_CHAIN_HARD_CAP:
+                return depth, "parent chain exceeded %d rows" % PARENT_CHAIN_HARD_CAP
+            try:
+                row = self.get_task(current)
+            except TaskbusError as exc:
+                return depth, "could not read row %s: %s" % (current, exc)
+            parents = row.parent_task
+            if not parents:
+                return depth, ""
+            if len(parents) > 1:
+                return depth, ("row %s has %d parents; the chain must be linear"
+                               % (current, len(parents)))
+            current = parents[0]
+            depth += 1
+            if depth >= MAX_SPAWN_DEPTH:
+                # Deep enough to refuse; the rest of the chain cannot change that.
+                return depth, ""
 
     # ---- credentials -----------------------------------------------------
     def exchange_key(self, ttl_minutes=15, scopes=None) -> Dict[str, Any]:
