@@ -17,7 +17,7 @@ from .supervisor import (SUPERVISOR_RESULT_PREFIX, parse_supervisor_result,
                          supervisor_close_body)
 from .worker import TaskbusWorker, HandlerResult
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = [
     "TaskbusClient", "Claim", "Row", "TaskbusWorker", "HandlerResult",
     "TaskbusError", "TaskbusAuthError", "TaskbusForbidden", "TaskbusConflict",

@@ -24,6 +24,7 @@ Deliberate design notes, each of which cost a real attempt to learn on the fleet
 """
 import json
 import os
+import urllib.parse
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -33,7 +34,7 @@ import httpx
 from .errors import TaskbusForbidden, TaskbusValidation, error_for
 
 DEFAULT_BASE_URL = "https://api.bare-ai.net"
-DEFAULT_UA = "bare-taskbus-sdk/0.1.2"
+DEFAULT_UA = "bare-taskbus-sdk/0.1.3"
 EXECUTOR_STATUSES = ("InProgress", "HumanReviewNeeded", "Blocked")
 # A claim holds the row for this long before it must be renewed or lapse.
 LEASE_SECONDS = 900
@@ -55,25 +56,46 @@ class Row:
     def id(self):
         return self.raw.get("id")
 
+    def _field(self, name):
+        """The named field, unwrapped, tolerating every shape the gateway sends.
+
+        Reads the key by name; if it is absent, looks inside a nested "fields"
+        envelope (the create echo is untyped, so it may nest the row). Returns None
+        only when the field is genuinely not present.
+        """
+        if not isinstance(self.raw, dict):
+            return None
+        value = self.raw.get(name)
+        if value is None:
+            fields = self.raw.get("fields")
+            if isinstance(fields, dict):
+                value = fields.get(name)
+        return _val(value)
+
+    def get(self, name, default=None):
+        """Field by name with a default, so callers never need .raw for the basics."""
+        value = self._field(name)
+        return default if value is None else value
+
     @property
     def status(self):
-        return _val(self.raw.get("status"))
+        return self._field("status")
 
     @property
     def priority(self):
-        return _val(self.raw.get("priority"))
+        return self._field("priority")
 
     @property
     def short_description(self):
-        return self.raw.get("short_description")
+        return self._field("short_description")
 
     @property
     def success_criterion(self):
-        return self.raw.get("success_criterion")
+        return self._field("success_criterion")
 
     @property
     def assigned(self):
-        return _val(self.raw.get("assigned_to_stakeholder_representative"))
+        return self._field("assigned_to_stakeholder_representative")
 
     @property
     def parent_task(self):
@@ -107,9 +129,30 @@ class Claim:
 
 
 def _val(value):
-    """Taskbus single-select and link fields arrive as objects or lists of objects."""
+    """Unwrap a Taskbus field into a plain Python value.
+
+    The same field arrives in several shapes, and the client must tolerate all of
+    them because the create response is untyped (the OpenAPI spec says its
+    field-level shape "is stable in practice but not yet promoted to a typed
+    model"):
+
+      * single-select: {"id": 8262, "value": "New", "color": "blue"}
+      * link row:      {"id": 84, "order": 1, "value": "bare-sales@host"}
+      * link list:     [{"id": 84, "value": "..."}] or a bare [84]
+      * plain scalar:  "New" / 3 / None
+
+    A dict with no usable "value" falls back to its id, and a nested {"fields":
+    {...}} envelope is unwrapped, so a caller never has to reach into .raw.
+    """
     if isinstance(value, dict):
-        return value.get("value")
+        if value.get("value") is not None:
+            return value["value"]
+        fields = value.get("fields")
+        if isinstance(fields, dict):
+            return fields
+        if value.get("id") is not None:
+            return value["id"]
+        return None
     if isinstance(value, list):
         out = [_val(v) for v in value]
         return out[0] if len(out) == 1 else out
@@ -152,9 +195,26 @@ class TaskbusClient:
         return resp.json()
 
     # ---- read ------------------------------------------------------------
-    def list_tasks(self, status="new,in_progress", page=1, page_size=100) -> List[Row]:
-        path = "/v1/taskbus/rows?status=%s&page=%d&page_size=%d" % (status, page, page_size)
-        data = self._request("GET", path)
+    def list_tasks(self, status=("new", "in_progress"), page=1, page_size=100) -> List[Row]:
+        """List rows, filtered by status.
+
+        status is a REPEATABLE query parameter, so it is sent once per value:
+        ?status=new&status=in_progress. A comma-joined string is a 400 from the
+        gateway (measured: "Unknown status value: 'new,in_progress'"), so a caller
+        who passes "new,in_progress" or a list gets it split and repeated here.
+
+        Accepts a single string, an iterable of strings, or None. None omits the
+        parameter, which the gateway documents as "only New and InProgress".
+        """
+        parts = []
+        if status is not None:
+            values = status.split(",") if isinstance(status, str) else list(status)
+            for value in values:
+                value = str(value).strip()
+                if value:
+                    parts.append("status=" + urllib.parse.quote(value, safe=""))
+        query = "&".join(parts + ["page=%d" % page, "page_size=%d" % page_size])
+        data = self._request("GET", "/v1/taskbus/rows?" + query)
         return [Row(r) for r in (data.get("results") or data.get("rows") or [])]
 
     def get_task(self, row_id) -> Row:
