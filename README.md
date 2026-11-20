@@ -45,8 +45,14 @@ you, and blocks a row rather than losing it when the handler raises.
     from bare_taskbus import TaskbusClient
 
     client = TaskbusClient()
-    for row in client.list_tasks(status="new"):
-        print(row.id, row.priority, row.short_description)
+    for row in client.list_tasks():                      # New + InProgress
+        print(row.id, row.status, row.priority, row.short_description)
+
+    # status is a REPEATABLE filter, so a list means "either of these".
+    # A single label, a comma-joined string, a list, or None (no filter) all work,
+    # and status=["all"] disables the filter entirely.
+    for row in client.list_tasks(status=["new", "InProgress"], page_size=50):
+        print(row.id, row.status)
 
     claim = client.claim_task(514)
     client.update_task(claim, status="HumanReviewNeeded",
