@@ -99,6 +99,12 @@ These are not style choices. Each one is a failure that costs real attempts to d
 6. Short-lived keys should be rotated at about 80 percent of the advertised TTL, and a failed rotation
    must fail closed: release held rows and stop claiming rather than run on a credential you cannot
    prove is valid.
+7. A link list stays a list. `_val()` collapses a one-element list to its element, which is right for a
+   single-select and wrong for watchers and parents: `[271]` would arrive as the integer 271. Those
+   fields go through `_ids()` instead, so `row.watchers` is `list[int]` even with one watcher.
+8. Clearing a list field needs an explicit empty list. `watchers=[]` sends the field; omitting it leaves
+   the existing value in place. Silently leaving the old value is the same class of defect as a
+   misspelled field name that the server ignores.
 
 ## Lease window and tenant isolation
 
@@ -143,6 +149,57 @@ echoed back. Only then does Gate 2 apply - reviewer authority, `403 forbidden_no
 key that is neither a dispatcher holding `taskbus:write` nor the compliance reviewer seat. Two
 gates, two codes, not interchangeable.
 
+
+## Watchers
+
+A row can carry `watchers_stakeholder_representative`: the representatives who want to be
+told about it. It is a notification annotation and nothing more.
+
+    row = client.get_task(514)
+    row.watchers                       # [271] - always a list, never a bare 271
+    client.update_task(claim, watchers=[271, 84])
+    client.update_task(claim, watchers=[])        # clear them
+
+Three things that surprise people, all of them deliberate:
+
+- **The accessor is list-preserving.** `Row.watchers` returns `list[int]`, so a row
+  watching exactly one representative gives `[271]`. Ask for a scalar accessor and you get
+  `None`; ask this one and you get a collection, which is what it is.
+- **A watcher grants nothing.** Being on the list does not let that representative claim
+  the row, write to it or review it. It is not an assignment either - read `row.assigned`
+  when you need to know who owns the work.
+- **The list is tenant-scoped, and a foreign id is refused.** A watcher outside your
+  tenant answers `403 tenant_scope_violation` rather than being quietly dropped, so an
+  integration that watches across tenants fails loudly instead of appearing to work.
+  Clearing is an explicit empty list: `watchers=[]` sends the field, and omitting
+  `watchers` leaves whatever is already there alone.
+
+## Execution profiles
+
+A row dispatched under an execution profile stores the snapshot it ran with, and you read
+it back per row:
+
+    profile = client.get_execution_profile(523)
+    if profile is None:
+        ...                                  # this row never ran under a profile
+    profile.slug                             # 'security-audit-frontier'
+    profile.profile_id                       # 2
+    profile.config_hash                      # the resolved config digest
+    profile.pinned_model                     # 'claude-sonnet-4-6|anthropic-us', or None
+    profile.exclude_providers                # ['deepseek', 'openai']
+    profile.routing_strategy                 # 'pinned' / 'cheapest_frontier' / ...
+
+The endpoint reads the snapshot **stored on the row**, so it never re-resolves the current
+profile: retire the profile or edit its role afterwards and this still returns what the
+run actually used. That is what makes it usable as history.
+
+- `pinned_model` is optional. Snapshots written before the profile upgrade do not carry
+  it, and an absent pin means "this run was not pinned", not "unknown". Check for `None`.
+- `exclude_providers` is a list; it is `[]` when the snapshot carries no exclusions.
+- A row that never ran under a profile answers `404 no_execution_profile`, which this
+  client reports as `None`. Every other failure raises - including a `404 row_not_found`,
+  which is also how the gateway answers for another tenant's row. `None` means "no
+  profile", never "not found".
 
 ## Recursion is bounded by the row chain
 
@@ -202,4 +259,6 @@ and a 405 proves the route is registered rather than that it works.
 
 ## Status
 
-0.1.0 - initial scaffold. Client and worker are usable; the MCP server requires the optional extra.
+0.1.4 - watchers (`Row.watchers`, `create_task(watchers=...)`, `update_task(watchers=...)`)
+and `get_execution_profile()`. Wire shapes were measured against the live gateway on
+2026-11-20. Client and worker are usable; the MCP server requires the optional extra.

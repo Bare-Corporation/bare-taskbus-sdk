@@ -21,6 +21,21 @@ Deliberate design notes, each of which cost a real attempt to learn on the fleet
     stakeholder_account_master, the route answers 404 row_not_found - deliberately a 404 and not
     a 403, because a 403 would confirm the row exists in another tenant. That gate runs BEFORE the
     idempotent branch, so a foreign row recorded verdict is never echoed back.
+  * watchers_stakeholder_representative is a LINK LIST, and the row's own shape is the
+    authority: a row watching exactly one representative still arrives as a one-element
+    list. Row.watchers therefore goes through _ids(), never _val(), because _val collapses
+    a one-element list to its element and [271] would silently become the integer 271
+    instead of representative 271. A watcher is a tenant-scoped notification annotation:
+    it grants NO claim and NO write on the watched row, it is not an assignment, and a
+    watcher outside the caller tenant is a 403 tenant_scope_violation rather than a
+    silent drop.
+  * the execution profile lives ON the row and is read back through its own route
+    (GET /v1/taskbus/rows/{id}/execution-profile). It carries the pinned_model and
+    exclude_providers / routing_strategy decisions that were resolved when the row was
+    dispatched, so it - not the current profile record - is the history. A row that never
+    ran under a profile answers 404 no_execution_profile, which get_execution_profile()
+    reports as None: an absent profile is a normal state, not a fault. Every other 404
+    RAISES, because row_not_found is also how the gateway answers for another tenant row.
 """
 import json
 import os
@@ -31,10 +46,10 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from .errors import TaskbusForbidden, TaskbusValidation, error_for
+from .errors import TaskbusError, TaskbusForbidden, TaskbusValidation, error_for
 
 DEFAULT_BASE_URL = "https://api.bare-ai.net"
-DEFAULT_UA = "bare-taskbus-sdk/0.1.3"
+DEFAULT_UA = "bare-taskbus-sdk/0.1.4"
 EXECUTOR_STATUSES = ("InProgress", "HumanReviewNeeded", "Blocked")
 # A claim holds the row for this long before it must be renewed or lapse.
 LEASE_SECONDS = 900
@@ -97,21 +112,35 @@ class Row:
     def assigned(self):
         return self._field("assigned_to_stakeholder_representative")
 
+    def _ids_field(self, name):
+        """The named link-list field as list[int], tolerating every row shape.
+
+        Same key-then-nested-envelope lookup as _field(), but the value goes through
+        _ids() so a one-element list stays a list instead of collapsing to a scalar.
+        """
+        if not isinstance(self.raw, dict):
+            return []
+        value = self.raw.get(name)
+        if value is None:
+            fields = self.raw.get("fields")
+            if isinstance(fields, dict):
+                value = fields.get(name)
+        return _ids(value)
+
+    @property
+    def watchers(self):
+        """Ids of the representatives watching this row. Always a list, never a scalar.
+
+        A watcher is a notification annotation and the gateway scopes it to the caller
+        tenant: it does not grant claim or write rights on the row, and it is not an
+        assignment. Use `assigned` when you need to know who owns the work.
+        """
+        return self._ids_field("watchers_stakeholder_representative")
+
     @property
     def parent_task(self):
-        """Ids of this row's parents. Accepts [1], [{"id": 1}] or 1."""
-        raw = self.raw.get("parent_task")
-        if raw is None:
-            return []
-        items = raw if isinstance(raw, list) else [raw]
-        out = []
-        for item in items:
-            value = item.get("id") if isinstance(item, dict) else item
-            try:
-                out.append(int(value))
-            except (TypeError, ValueError):
-                continue
-        return out
+        """Ids of this row's parents. Accepts [1], [{"id": 1}] or 1, always as a list."""
+        return self._ids_field("parent_task")
 
     def __repr__(self):
         return "Row(id=%r, status=%r, priority=%r)" % (self.id, self.status, self.priority)
@@ -126,6 +155,99 @@ class Claim:
     @property
     def lease_expires_at(self):
         return self.raw.get("lease_expires_at")
+
+
+@dataclass
+class ExecutionProfile:
+    """The execution-profile snapshot a row was dispatched under (Execution Profiles v1.1).
+
+    Read-only history: the gateway stores the snapshot ON the row, so this does not change
+    when the profile record or the role behind it is later edited or retired. The shape
+    below was measured against the live gateway on 2026-11-20:
+
+        row_id, profile_id, slug, version, config_hash, profile_hash, resolved_at,
+        integrity, reviewer_authority, role {alias, content_sha256},
+        snapshot {snapshot_version, profile, role, execution_config, resolved_at}
+
+    execution_config carries the routing decisions a caller cares about: pinned_model,
+    exclude_providers, routing_strategy, plus role_alias, role_content_sha256,
+    routing_ceiling_eur, max_attempts and require_human_review.
+
+    pinned_model is read as OPTIONAL on purpose. Snapshots written before the 2026-11-20
+    profile upgrade do not carry it, and an absent pin means "this run was not pinned",
+    not "the pin is unknown". A caller that requires a pin must check for None itself.
+    """
+
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def row_id(self):
+        return self.raw.get("row_id")
+
+    @property
+    def profile_id(self):
+        return self.raw.get("profile_id")
+
+    @property
+    def slug(self):
+        return self.raw.get("slug")
+
+    @property
+    def version(self):
+        return self.raw.get("version")
+
+    @property
+    def config_hash(self):
+        return self.raw.get("config_hash")
+
+    @property
+    def profile_hash(self):
+        return self.raw.get("profile_hash")
+
+    @property
+    def resolved_at(self):
+        return self.raw.get("resolved_at")
+
+    @property
+    def integrity(self):
+        return self.raw.get("integrity")
+
+    @property
+    def reviewer_authority(self):
+        return self.raw.get("reviewer_authority")
+
+    @property
+    def role_alias(self):
+        role = self.raw.get("role")
+        return role.get("alias") if isinstance(role, dict) else None
+
+    @property
+    def snapshot(self):
+        snap = self.raw.get("snapshot")
+        return snap if isinstance(snap, dict) else {}
+
+    @property
+    def execution_config(self):
+        config = self.snapshot.get("execution_config")
+        return config if isinstance(config, dict) else {}
+
+    @property
+    def pinned_model(self):
+        return self.execution_config.get("pinned_model")
+
+    @property
+    def exclude_providers(self):
+        """Providers this run was told to avoid. [] when the snapshot carries none."""
+        value = self.execution_config.get("exclude_providers")
+        return list(value) if isinstance(value, (list, tuple)) else []
+
+    @property
+    def routing_strategy(self):
+        return self.execution_config.get("routing_strategy")
+
+    def __repr__(self):
+        return "ExecutionProfile(row_id=%r, slug=%r, pinned_model=%r)" % (
+            self.row_id, self.slug, self.pinned_model)
 
 
 def _val(value):
@@ -157,6 +279,33 @@ def _val(value):
         out = [_val(v) for v in value]
         return out[0] if len(out) == 1 else out
     return value
+
+
+def _ids(value):
+    """A link-list field as list[int], PRESERVING the list shape.
+
+    Why this exists next to _val(): _val deliberately collapses a one-element list to its
+    element, which is right for a single-select and wrong for a link list. A row watching
+    exactly one representative must still report [271]; reporting 271 instead loses the
+    fact that it is a collection and breaks every caller that iterates row.watchers or
+    compares against a list.
+
+    Accepts [271], [{"id": 271}], [{"id": 271, "value": "..."}], a bare 271, "271", None.
+    An unusable entry is skipped rather than raising, so one malformed link cannot make
+    the whole row unreadable - the same tolerance _val() applies to its own shapes.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            item = item.get("id")
+        try:
+            out.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 class TaskbusClient:
@@ -220,10 +369,31 @@ class TaskbusClient:
     def get_task(self, row_id) -> Row:
         return Row(self._request("GET", "/v1/taskbus/rows/%d" % int(row_id)))
 
+    def get_execution_profile(self, row_id):
+        """The ExecutionProfile snapshot for a row, or None when it has none.
+
+        GET /v1/taskbus/rows/{row_id}/execution-profile reads the snapshot stored ON the
+        row and never re-resolves the current profile, so this is history: it survives
+        the profile record being retired or its role being edited afterwards.
+
+        Measured against the live gateway on 2026-11-20, a row that was never dispatched
+        under a profile answers 404 {"error": "no_execution_profile"}. That is a normal
+        state and is reported as None. Every other failure RAISES - notably a 404
+        row_not_found, which is also how the gateway answers for another tenant's row, so
+        a missing row must never be mistaken for a row without a profile.
+        """
+        try:
+            return ExecutionProfile(self._request(
+                "GET", "/v1/taskbus/rows/%d/execution-profile" % int(row_id)))
+        except TaskbusError as exc:
+            if exc.status == 404 and exc.code == "no_execution_profile":
+                return None
+            raise
+
     # ---- write -----------------------------------------------------------
     def create_task(self, short_description, ai_prompt, success_criterion=None,
                     priority="medium", max_attempts=3, assigned_rep_id=None,
-                    depends_on=None) -> Row:
+                    depends_on=None, watchers=None, parent_task=None) -> Row:
         body = {"short_description": short_description, "ai_prompt": ai_prompt,
                 "priority": priority, "max_attempts": max_attempts}
         if success_criterion:
@@ -232,6 +402,14 @@ class TaskbusClient:
             body["assigned_to_stakeholder_representative"] = [int(assigned_rep_id)]
         if depends_on:
             body["dependant_on_task"] = [int(x) for x in depends_on]
+        if watchers is not None:
+            # A link list goes on the wire as [int]; the row reads it back through _ids().
+            # An explicit [] is sent rather than omitted so the caller's intent is on the
+            # request, not inferred from a missing key.
+            body["watchers_stakeholder_representative"] = [int(x) for x in watchers]
+        if parent_task is not None:
+            parents = parent_task if isinstance(parent_task, (list, tuple)) else [parent_task]
+            body["parent_task"] = [int(x) for x in parents]
         return Row(self._request("POST", "/v1/taskbus/rows", body))
 
     def claim_task(self, row_id) -> Claim:
@@ -239,7 +417,7 @@ class TaskbusClient:
         return Claim(row_id=int(row_id), nonce=data.get("nonce"), raw=data)
 
     def update_task(self, claim: Claim, status=None, machines_response=None,
-                    reason=None, **extra) -> Row:
+                    reason=None, watchers=None, **extra) -> Row:
         if status is not None and status not in EXECUTOR_STATUSES:
             raise TaskbusForbidden(
                 "an executor may only set %s; %r belongs to the review route"
@@ -251,6 +429,11 @@ class TaskbusClient:
             body["machines_response"] = machines_response
         if reason is not None:
             body["re_opened_or_retry_reason"] = reason
+        if watchers is not None:
+            # An EMPTY list is meaningful here: it CLEARS the watchers. Never collapse this
+            # with "if watchers", or the row keeps its watchers while the caller believes
+            # the change landed - the same silent-no-op class as a misspelled field name.
+            body["watchers_stakeholder_representative"] = [int(x) for x in watchers]
         if status in ("HumanReviewNeeded", "Blocked") and "re_opened_or_retry_reason" not in body:
             body["re_opened_or_retry_reason"] = "closed by bare-taskbus-sdk"
         if not claim.nonce:

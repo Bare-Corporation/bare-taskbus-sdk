@@ -12,14 +12,15 @@ from .errors import (
     TaskbusUnavailable,
 )
 from .client import (HEARTBEAT_HORIZON_SECONDS, LEASE_SECONDS, MAX_SPAWN_DEPTH,
-                     TaskbusClient, Claim, Row)
+                     TaskbusClient, Claim, ExecutionProfile, Row)
 from .supervisor import (SUPERVISOR_RESULT_PREFIX, parse_supervisor_result,
                          supervisor_close_body)
 from .worker import TaskbusWorker, HandlerResult
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 __all__ = [
-    "TaskbusClient", "Claim", "Row", "TaskbusWorker", "HandlerResult",
+    "TaskbusClient", "Claim", "ExecutionProfile", "Row", "TaskbusWorker",
+    "HandlerResult",
     "TaskbusError", "TaskbusAuthError", "TaskbusForbidden", "TaskbusConflict",
     "TaskbusValidation", "TaskbusUnavailable", "__version__",
     "LEASE_SECONDS", "HEARTBEAT_HORIZON_SECONDS", "MAX_SPAWN_DEPTH",
