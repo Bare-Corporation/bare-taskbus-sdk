@@ -49,7 +49,7 @@ import httpx
 from .errors import TaskbusError, TaskbusForbidden, TaskbusValidation, error_for
 
 DEFAULT_BASE_URL = "https://api.bare-ai.net"
-DEFAULT_UA = "bare-taskbus-sdk/0.1.4"
+DEFAULT_UA = "bare-taskbus-sdk/0.2.0"
 EXECUTOR_STATUSES = ("InProgress", "HumanReviewNeeded", "Blocked")
 # A claim holds the row for this long before it must be renewed or lapse.
 LEASE_SECONDS = 900

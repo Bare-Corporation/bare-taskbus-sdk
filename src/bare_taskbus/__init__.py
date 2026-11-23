@@ -16,10 +16,16 @@ from .client import (HEARTBEAT_HORIZON_SECONDS, LEASE_SECONDS, MAX_SPAWN_DEPTH,
 from .supervisor import (SUPERVISOR_RESULT_PREFIX, parse_supervisor_result,
                          supervisor_close_body)
 from .worker import TaskbusWorker, HandlerResult
+from .secrets import SecretNotFound, SecretsClient
+from .criterion import (GRAMMAR_VERSION, criterion_label, directives,
+                        format_check, parse_check, split_checks)
 
-__version__ = "0.1.4"
+__version__ = "0.2.0"
 __all__ = [
     "TaskbusClient", "Claim", "ExecutionProfile", "Row", "TaskbusWorker",
+    "SecretsClient", "SecretNotFound",
+    "GRAMMAR_VERSION", "criterion_label", "directives", "format_check",
+    "parse_check", "split_checks",
     "HandlerResult",
     "TaskbusError", "TaskbusAuthError", "TaskbusForbidden", "TaskbusConflict",
     "TaskbusValidation", "TaskbusUnavailable", "__version__",
